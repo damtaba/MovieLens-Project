@@ -1,0 +1,590 @@
+---
+title: "Movie Lens ML Project"
+author: "Dario Taba"
+date: "01/03/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1 Introduction
+
+Filtering system is the one that is responsible for cleaning redundant or unwanted information, trying to avoid the overload of irrelevant information. From here derive recommendation systems, which try to predict a rating or user preference on a content or object. These systems today are very comprehensive, ranging from the generation of music playlists, to recommendation on e-commerce platforms and search engines.
+
+In our case, we will focus on movie recommendation systems. Recommendation systems are used by various multimedia content companies, such as Netflix, YouTube or Amazon Prime Video, to be able to decide the relevant content for their users and to be able to retain attention on their platforms for as long as possible. 
+
+## 1.1 Movie Recomendation
+We will create a model that can predict the rating of a movie based on characteristics in the database.
+
+The database will be MovieLens. MovieLens is a research site run by GroupLens Research at the University of Minnesota. The base has 10 million movie ratings by 72 thousand users. Users were randomly selected, having voted at least 20 times (<https://grouplens.org/datasets/movielens/10m/>).
+
+## 1.2 Data Preparation for the model and Pre analysis
+### 1.2.1 Getting the base database
+
+The initial database is obtained using the following script. This code was provided at the beginning of the current course.
+
+
+```{r warning=FALSE, message=FALSE}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org") 
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(recosystem)) install.packages("recosystem") # For matrix factorization
+if(!require(tinytex)) install.packages("tinytex") 
+
+# For making the pdf
+if(!require(rmarkdown)) install.packages("rmarkdown")
+#if(!require(proTeXt)) install.packages("proTeXt")
+if(!require(formatR)) install.packages("formatR")
+if(!require(latexpdf)) install.packages("latexpdf") 
+if(!require(xfun)) install.packages("xfun") 
+#if(!require(proTeXt)) install.packages("MikTek") 
+#tinytex::install_tinytex()
+options(pillar.sigfig=7)
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(recommenderlab)
+library(recosystem)
+library(ggthemes)
+#library(MikTek)
+library(latexpdf)
+library(xfun)
+library(tinytex)
+library(rmarkdown)
+library(formatR)
+#library(proTeXt)
+
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 3.6 or earlier:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+edx1 <- edx # to not use the original edx
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+
+Before starting the analysis of the variables, we will create one more referencing the year of the movie.
+
+
+```{r warning=FALSE, message=FALSE}
+edx_clean <- 
+  edx1 %>%
+  mutate(title = str_trim(title)) %>% # to not have problems with white spaces
+  mutate(year_title_temp = str_extract_all(title,pattern="\\((\\d{4})\\)"),year_title = as.integer(str_extract(year_title_temp,pattern = "\\d{4}"))) %>% # First it will catch the 4 numbers that are between parethesis. Then, it will remove the parethesis.
+  select(-year_title_temp)
+```
+
+With this code we obtain `edx_clean`, with which we will make the model, and `validation`, with which we will do the final validation.
+
+### 1.2.2 First approach to the database
+
+First we will execute a summary of the database. 
+
+```{r warning=FALSE, message=FALSE}
+str(edx_clean)
+```
+
+The variables are: userId (Integer), movieId (Integer), rating (Numeric), timestamp (Integer, should be date), title (character), genres (character) and year_title (integer).
+
+We can see with this the 7 columns of the table, together with their type, where 9.000.055 is the total number of records in the `edx_clean` database. 
+
+### 1.2.2.1 UserId
+
+The first variable is userId. It is the identification number of the user who made the rate. In our dataset, we have 69.878 users.  
+
+``` {r warning=FALSE, message=FALSE}
+edx_clean %>%
+  group_by(userId) %>%
+  summarise(n=n()) %>%
+  arrange((desc(n)))
+```
+
+With the following graph we can see the distribution of the rates made. We can see that it is distributed to the left, showing that most users accumulate in the first bars.
+
+``` {r warning=FALSE, message=FALSE}
+edx_clean %>%
+  group_by(userId) %>%
+  summarise(n=n()) %>%
+  arrange((desc(n))) %>%
+  ggplot(aes(n)) +
+  geom_histogram(binwidth = 50) +
+  xlim(0,1500) + #Beeing 0.2% who made more than 1500 reviews
+  ylim(0,2000)+
+  xlab("Total reviews made by every user") +
+  theme_economist() +
+  ggtitle("Distribution of total reviews per user")
+```
+
+Here is a graph that represents the number of rates made by each userId, against the variance of the rates. What can be observed is that as we have more records of each userId, we can see that there are people who tend to score movies on the same values, decreasing the variance, demonstrating the existence of a user effect.
+
+``` {r warning=FALSE, message=FALSE}
+edx_clean %>%
+  group_by(userId) %>%
+  summarise(n=n(),rating_avg=mean(rating),var_ratings = var(rating)) %>%
+  ggplot(aes(n,var_ratings)) +
+  geom_point(alpha=0.2)+ # Making it more visual where is most of the data
+  xlim(0,3000)+
+  ggtitle("Total of Rates Made by Every User vs Variance of the Ratings")+
+  xlab("Rates Made")+
+  ylab("Variance")+
+  theme_economist()
+```
+
+### 1.2.2.2 MovieId
+
+MovieId is the code of every movie rated in the dataset. Movielens provides us with ratings information for 10,677 movies.
+
+``` {r warning=FALSE, message=FALSE}
+edx_clean %>%
+  group_by(movieId) %>%
+  summarise(n=n()) %>%
+  arrange((desc(n)))
+```
+
+In the case of movies it is more direct to think that there is a relationship with their rating. In the following graph it can be seen that as each movie has more ratings, the variance begins to stabilize and decrease, demonstrating with data the relationship.
+
+```{r warning=FALSE, message=FALSE}
+edx_clean %>%
+  group_by(movieId) %>%
+  summarise(n=n(),rating_avg=mean(rating),var_ratings = var(rating)) %>%
+  ggplot(aes(n,var_ratings)) +
+  geom_point(alpha=0.2)+ # Making it more visual where is most of the data
+  xlim(0,3000)+
+  ggtitle("Total of Rates Made for Every Movie vs Variance of the Ratings")+
+  xlab("Rates Made")+
+  ylab("Variance")+
+  theme_economist()
+```
+
+### 1.2.2.3 Genres
+
+There are 20 genres in the dataset, and combinations of them, making 797 possibilities. 
+
+``` {r warning=FALSE, message=FALSE}
+edx_clean %>%
+  group_by(genres) %>%
+  summarise(n=n()) %>%
+  arrange((desc(n)))
+```
+
+Calculating the average, we can see differences between the different genres, a characteristic that we will use later to build the model.
+
+```{r warning=FALSE, message=FALSE}
+edx_clean %>% 
+  group_by(genres) %>% 
+  summarise(n=n(),avg_rating=mean(rating)) %>% 
+  arrange(desc(n))
+  
+```
+
+### 1.2.2.3 Year_title
+
+This variable indicates the year the movie was released. There are movies from 1915 to 2008. 
+
+```{r warning=FALSE, message=FALSE}
+edx_clean %>% 
+  group_by(year_title) %>% 
+  summarise(n=n()) %>%
+  ggplot(aes(year_title,n)) +
+  geom_line()+
+  theme_economist()+
+  xlab("Year")+
+  ylab("n")+
+  ggtitle("Total Ratings made by Year")
+```
+
+The composition by rating of the previous graph.
+
+```{r warning=FALSE, message=FALSE}
+edx_clean %>% 
+  group_by(year_title,rating) %>% 
+  summarise(n=n()) %>% 
+  mutate(rating = as.factor(rating))%>%
+  ggplot(aes(year_title,n,fill=rating))+
+  geom_bar(position="fill", stat="identity")+
+  scale_y_continuous(labels = scales::percent_format())+
+  theme_economist()+
+  xlab("Year")+
+  ylab("Composition")+
+  ggtitle("Composition of ratings")
+```
+
+
+# 2 Methods and Analysis
+
+We will use different methods to generate models and they will be compared to see the predictability of each one. In order to quantify and measure predictability we will use the RMSE of each one, being a frequently used measure of the differences between the values predicted by a model or an estimator and the observed values. 
+
+$$RMSE=\sqrt{\frac{1}{N}\sum_{u,i}(\hat{y}_{u,i}-y_{u,i})^2}$$
+
+We will generate, within the edx_clean dataset, a partition to train the model and another to test it.Thanks to the size of our dataset, the partition will be 90/10, being 90% for training and 10% for testing. 
+This leaves us with the following 3 objects: validation_final, test_set and train_set.
+
+```{r warning=FALSE, message=FALSE}
+#Creating the partition of the edx_clean dataset. We'll use 90% for the training of the model and 10% for testing. 
+#This ratio is possible thanks to the large amount of data
+test_index <- createDataPartition(edx_clean$rating,p=0.1,list=FALSE)
+
+
+train_set <- edx_clean[-test_index,] 
+test_set_temp <- edx_clean[test_index,]
+validation_temp <- validation
+
+# Matching the dataset variables for the test set
+test_set <- test_set_temp %>%
+  semi_join(train_set,by="movieId") %>%
+  semi_join(train_set,by="userId") %>%
+  semi_join(train_set,by="genres") %>%
+  semi_join(train_set,by="year_title")
+
+# Matching the dataset variables for the validation set
+validation_final <- 
+  validation_temp %>%
+  # select(title) %>%
+  #  head(n = 1) %>%
+  mutate(title = str_trim(title)) %>%
+  mutate(year_title_temp = str_extract_all(title,pattern="\\((\\d{4})\\)"),year_title = as.integer(str_extract(year_title_temp,pattern = "\\d{4}"))) %>%
+  select(-year_title_temp) %>%
+  semi_join(train_set,by="movieId") %>%
+  semi_join(train_set,by="userId") %>%
+  semi_join(train_set,by="genres") %>%
+  semi_join(train_set,by="year_title")
+```
+
+## 2.1 Just the average rating
+What we do in this first approximation is to explain the ratings based on the general average, explaining the differences due to random variations.
+
+$$\hat Y_{u,i}=\mu+\epsilon_{i,u}$$
+
+```{r warning=FALSE, message=FALSE}
+mu_hat <-mean(train_set$rating) #average of all ratings
+
+predicted_avg <- rep(mu_hat,times= nrow(test_set)) #the predictions, all the same
+
+RMSE_avg<- RMSE(predicted_avg,test_set$rating)
+
+RMSEs_Table <- tibble(Method = "Goal", RMSE = 0.8649)
+RMSEs_Table <- bind_rows(RMSEs_Table, 
+                    tibble(Method = "Just the average of ratings",RMSE=RMSE_avg))
+
+RMSEs_Table
+```
+
+As we can see, we still obtain an RMSE very far from the ideal.
+
+## 2.2 Adding the effect of other variables
+
+### 2.2.1 Adding the effect of movieId
+
+To reduce the participation of random variation, we are going to explain part of it by the movieId effect, leaving our model as follows.
+
+$$\hat Y_{u,i}=\mu + b_m + \epsilon_{i,u}$$
+
+Using this new addition, our model would be:
+
+```{r warning=FALSE, message=FALSE}
+
+movie_avgs <- train_set %>%
+  group_by(movieId) %>% 
+  summarize(b_movie = mean(rating - mu_hat)) # substracting the part explained by the total average
+
+predicted_avg_movie <- test_set %>%
+  left_join(movie_avgs,by='movieId') %>%
+  mutate(prediction = mu_hat+b_movie) %>%
+  .$prediction
+
+
+RMSE_avg_movie<- RMSE(predicted_avg_movie,test_set$rating)
+
+RMSEs_Table <- bind_rows(RMSEs_Table, 
+                    tibble(Method = "Avg + movie effect",RMSE=RMSE_avg_movie))
+RMSEs_Table
+```
+
+### 2.2.2 Adding the effect of userId
+
+Following the previous logic, we will add the userId variable to explain part of the previous random variation.
+
+$$\hat Y_{u,i}=\mu + b_m + b_u + \epsilon_{i,u}$$
+
+```{r warning=FALSE, message=FALSE}
+#making the averages for every user
+user_avgs <- train_set %>% 
+  left_join(movie_avgs,by='movieId') %>%
+  group_by(userId) %>% 
+  summarize(b_user = mean(rating - mu_hat - b_movie)) # substracting the part explained by the total average and movie effect
+
+predicted_avg_movie_user <- test_set %>%
+  left_join(movie_avgs,by='movieId') %>%
+  left_join(user_avgs,by='userId') %>%
+  mutate(prediction = mu_hat+b_movie+b_user) %>%
+  .$prediction
+
+
+RMSE_avg_movie_user<- RMSE(predicted_avg_movie_user,test_set$rating)
+
+RMSEs_Table <- bind_rows(RMSEs_Table, 
+                    tibble(Method = "Avg + movie and user effect",RMSE=RMSE_avg_movie_user))
+RMSEs_Table
+```
+
+
+### 2.2.3 Adding the effect of genres
+
+In the case of genres, we can see that each rating can have a movie with several genres. What we will do is separate the genres in order to have complete information on each genre. In the case of compound genres, the base will not be divided.
+
+$$\hat Y_{u,i}=\mu + b_m + b_u + b_g + \epsilon_{i,u}$$
+
+```{r warning=FALSE, message=FALSE}
+#making the averages for every user
+genre_avg_more_than_one_avg <- train_set %>%
+  filter(str_detect(genres,"\\|")==TRUE) %>% #movies with more than one genre
+  left_join(movie_avgs,by='movieId') %>%
+  left_join(user_avgs,by='userId') %>%
+  group_by(genres) %>% 
+  summarize(b_genre = mean(rating - mu_hat - b_user - b_movie)) # substracting the part explained by the total average and movie and user effect
+
+#making the averages for every genre
+genre_avg_per_genre_avgs <- train_set %>% 
+  left_join(movie_avgs,by='movieId') %>%
+  left_join(user_avgs,by='userId') %>%
+  separate_rows(genres, sep = "\\|") %>%
+  group_by(genres) %>% 
+  summarize(b_genre = mean(rating - mu_hat - b_user - b_movie)) # substracting the part explained by the total average and movie and user effect
+
+genre_avgs <- bind_rows(genre_avg_more_than_one_avg,genre_avg_per_genre_avgs)
+
+predicted_avg_movie_user_genres <- test_set %>%
+  left_join(movie_avgs,by='movieId') %>%
+  left_join(user_avgs,by='userId') %>%
+  left_join(genre_avgs,by='genres') %>%
+  mutate(prediction = mu_hat+b_movie+b_user+b_genre) %>%
+  .$prediction
+
+
+RMSE_avg_movie_user_genres<- RMSE(predicted_avg_movie_user_genres,test_set$rating)
+
+RMSEs_Table <- bind_rows(RMSEs_Table, 
+                    tibble(Method = "Avg + movie, user and genres effect",RMSE=RMSE_avg_movie_user_genres))
+RMSEs_Table
+```
+
+
+### 2.2.4 Adding the effect of year_title
+
+Finally, we will incorporate the last variable to the model, the year of the movie.
+
+$$\hat Y_{u,i}=\mu + b_m + b_u + b_g + b_y + \epsilon_{i,u}$$
+
+```{r warning=FALSE, message=FALSE}
+#making the averages for every user
+year_avgs <- train_set %>% 
+  left_join(movie_avgs,by='movieId') %>%
+  left_join(user_avgs,by='userId') %>%
+  left_join(genre_avgs,by='genres') %>%
+  group_by(year_title) %>% 
+  summarize(b_year = mean(rating - mu_hat - b_movie - b_user - b_genre)) # substracting the part explained by the total average and movie, user and year effect
+
+predicted_avg_movie_user_genres_year <- test_set %>%
+  left_join(movie_avgs,by='movieId') %>%
+  left_join(user_avgs,by='userId') %>%
+  left_join(genre_avgs,by='genres') %>%
+  left_join(year_avgs,by='year_title') %>%
+  mutate(prediction = mu_hat + b_movie + b_user + b_genre + b_year) %>%
+  .$prediction
+
+
+RMSE_avg_movie_user_genres_year<- RMSE(predicted_avg_movie_user_genres_year,test_set$rating)
+
+RMSEs_Table <- bind_rows(RMSEs_Table, 
+                    tibble(Method = "Avg + movie, user, genres and year effect",RMSE=RMSE_avg_movie_user_genres_year))
+RMSEs_Table
+```
+
+As we can see, with each incorporation of a variable, we are being able to reduce the RMSE, leaving less and less participation to random variations.
+
+## 2.3 Regularization
+
+What regularization does is penalize the information based on small samples by incorporating the lambda variable. By iterating through different lambda scenarios, the lambda that minimizes the RMSE is selected.
+
+The structure in which the lambda is incorporated is by increasing the denominator in the averages, the higher the lambda, the more it is penalized, trying to reach an equilibrium by minimizing the RMSE.
+
+```{r warning=FALSE, message=FALSE}
+lambdas1 <- seq(1,10,1) #Iteration of lambdas
+
+# Iterating the lambdas
+rmses_lambdas_reg1 <- sapply(lambdas1,function(x){
+  #Using the terms that previously were done, but with some changes doing the regularization
+  mu <- mean(train_set$rating)
+  
+  movie_avgs_reg1 <- train_set %>%
+    group_by(movieId) %>% 
+    summarize(b_movie = sum(rating - mu)/(n()+x))
+  
+  user_avgs_reg1 <- train_set %>% 
+    left_join(movie_avgs_reg1,by='movieId') %>%
+    group_by(userId) %>% 
+    summarize(b_user = sum(rating - mu - b_movie)/(n()+x))   
+  
+  b_g_1_reg1 <- train_set %>%
+    filter(str_detect(genres,"\\|")==TRUE) %>% # Knowing the separator for every genre is "|", just filtering reviews with compound genres
+    left_join(movie_avgs_reg1,by='movieId') %>%
+    left_join(user_avgs_reg1,by='userId') %>%
+    group_by(genres) %>%
+    summarize(b_genres = sum(rating - mu - b_user - b_movie)/(n()+x))  
+  
+  # Since separating the different genres of each film changes the original base, we will not calculate the value of labda taking this base into account
+  b_g_2_reg1 <- train_set %>%
+    left_join(movie_avgs_reg1,by='movieId') %>%
+    left_join(user_avgs_reg1,by='userId') %>%    
+    separate_rows(genres, sep = "\\|") %>%   # The separator for every genre is "|" 
+    group_by(genres) %>%
+    summarize(b_genres = sum(rating - mu - b_user - b_movie)/(n()))
+  
+  b_g_reg1 <- bind_rows(b_g_1_reg1,b_g_2_reg1)
+  
+  b_y_reg1 <- train_set %>%
+    left_join(movie_avgs_reg1,by='movieId') %>%
+    left_join(user_avgs_reg1,by='userId') %>%
+    left_join(b_g_reg1,by='genres') %>%
+    group_by(year_title) %>%
+    summarize(b_years = sum(rating - mu - b_user - b_movie-b_genres)/(n()+x))
+  
+  predicted_ratings <- test_set %>%
+    left_join(movie_avgs_reg1,by='movieId') %>%
+    left_join(user_avgs_reg1,by='userId') %>%
+    left_join(b_g_reg1,by='genres') %>%
+    left_join(b_y_reg1,by='year_title') %>%
+    mutate(pred = mu + b_movie + b_user + b_genres + b_years) %>% # Making the predictions
+    .$pred
+  
+  return(RMSE(predicted_ratings,test_set$rating)) # Returning just the RMSE
+  
+}
+)
+
+qplot(lambdas1,rmses_lambdas_reg1)
+lambda1 <- lambdas1[which.min(rmses_lambdas_reg1)] # This lambda minimizes RMSE
+
+```
+
+
+The lambda that minimizes the RMSE is `r lambda1`, with a RMSE of `r min(rmses_lambdas_reg1)`.
+
+```{r warning=FALSE, message=FALSE}
+RMSEs_Table <- bind_rows(RMSEs_Table, 
+                         tibble(Method = "Regularization",RMSE=min(rmses_lambdas_reg1)))
+
+RMSEs_Table
+```
+
+As we can see, it has a negative effect to assume the information is equally true regardless of the sample in which it is held. We can improve RMSE by applying regularization.
+
+## 2.3 Matrix Factorization
+
+Matrix factoring algorithms work by decomposing the user-element interaction matrix into the product of two rectangular matrices of lesser dimension. The idea of this approach is to discover relationships between the different subgroups within the entire population.
+
+We will do the matrix factorization thanks to the `recosystem` package, loaded at the beginning along with all the other packages
+
+```{r warning=FALSE, message=FALSE}
+
+#Making the train dataset
+train_data_mf <-  with(train_set, data_memory(user_index = userId,item_index = movieId, rating     = rating))
+
+#Making the test dataset
+test_data_mf  <-  with(test_set,data_memory(user_index = userId, item_index =movieId,rating= rating))
+
+# object of class "RecoSys" that can be used to construct recommender model and conduct prediction
+r <-  recosystem::Reco()
+
+# Training the data
+r$train(train_data_mf)
+
+# Making predictions
+y_hat_reco <-  r$predict(test_data_mf, out_memory())
+
+
+RMSEs_Table <- bind_rows(RMSEs_Table, 
+                         tibble(Method = "Matrix Factorization",RMSE=RMSE(test_set$rating, y_hat_reco)))
+RMSEs_Table
+```
+
+We can see that of all, this model is the one that best RMSE brings us, being able to meet the objective and exceed it.
+
+# 3 Results
+
+Having already finished the models, in the following table we can see the result:
+
+```{r warning=FALSE, message=FALSE}
+RMSEs_Table
+```
+
+The model with matrix_factorization being the one with the best predictability, we test it with the dataset `validation_final`.
+
+```{r warning=FALSE, message=FALSE}
+#Making the validation dataset
+validation_data_mf  <-  with(validation_final,  data_memory(user_index = userId, 
+                                              item_index = movieId, 
+                                              rating     = rating))
+
+r <-  recosystem::Reco()
+
+r$train(train_data_mf)
+
+y_hat_reco_validation <-  r$predict(validation_data_mf, out_memory())
+
+RMSEs_Table <- bind_rows(RMSEs_Table, 
+                         tibble(Method = "Final Validation",RMSE=RMSE(validation_final$rating, y_hat_reco_validation)))
+
+RMSEs_Table
+```
+
+The model, as in the training and test process, with the `validation_final` base also obtains a very good RMSE, `r RMSE(validation_final$rating, y_hat_reco_validation)`, complying with the requirements.
+
+# 4 Conclusion
+
+We started with a very simple and basic model, assuming that all ratings are the same, their differences only explained by random variations. This first approximation left us with an RMSE of `r RMSE_avg`. Being this very far from the ideal, we begin to explain this random variation with different characteristics, reaching an RMSE of `r RMSE_avg_movie_user_genres_year`.
+As this is still insufficient, we tried regularization, stripping ourselves of information that does not have enough information to be relevant like others. This led us to reach a `r min(rmses_lambdas_reg1)` of RMSE. Finally, with matrix factorization, we use a more advanced model, not with linear approximations as we tried previously, being able to reach an RMSE of `r RMSE(test_set$rating, y_hat_reco)`
+
+Having our model, we did tests with the validation_final base, in order to measure our model, being an RMSE similar to the previous one, with `r RMSE(validation_final$rating, y_hat_reco_validation)` fo RMSE.
+
+Even with its limitations, such as not being designed to perform in the same way with new records of the other variables, for example new movies, new users, etc., this last model is by far the best approximation to the reality of all that we saw, being the one chosen to be the final model
+
